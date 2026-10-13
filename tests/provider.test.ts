@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ProviderEventSchema, type ProviderEvent, type ProviderSessionConfig } from '@getpaseo/plugin/server/provider';
 import { createProvider } from '../server/provider';
+import type { SendOptions } from '../server/gemini-browser';
+import { researchCardSchema } from '../shared/research';
 
 const config: ProviderSessionConfig = { cwd: process.cwd(), env: {}, mcpServers: {}, settings: {}, persist: true, mode: 'ask' };
 const requestText = '```json\n{"protocol":"paseo_tool","id":"write-1","tool":"write_file","arguments":{"path":"demo.txt","content":"hello"}}\n```';
@@ -11,6 +13,7 @@ async function setup(replies = ['hello'], mode = 'ask', controls: {
   configure?: (browserId: string, thinking: 'low' | 'medium' | 'high') => Promise<void>;
   readResearchReport?: () => Promise<{ text: string; url: string }>;
   snapshots?: string[];
+  research?: (options: SendOptions) => Promise<void>;
 } = {}) {
   const events: ProviderEvent[] = [];
   const sent: string[] = [];
@@ -21,15 +24,16 @@ async function setup(replies = ['hello'], mode = 'ask', controls: {
       open: async () => ({ browserId: 'tab-1', url: 'https://gemini.google.com/app/testchat' }),
       configure: controls.configure ?? (async () => {}), stop: controls.stop ?? (async () => {}), close: async () => {},
       readResearchReport: controls.readResearchReport ?? (async () => ({ text: 'existing report', url: 'https://gemini.google.com/app/testchat' })),
-      send: async (_id: string, _text: string, options: { onText: (text: string) => void }) => {
+      send: async (_id: string, _text: string, options: SendOptions) => {
         sent.push(_text);
+        await controls.research?.(options);
         for (const snapshot of controls.snapshots ?? []) options.onText(snapshot);
         const text = replies.shift() ?? 'done'; options.onText(text);
         return { text, url: 'https://gemini.google.com/app/testchat' };
       },
     }),
     createExecutor: () => ({ validate: async () => {}, execute: async () => { writes++; return 'written'; } }),
-  }).connect({ versions: [1], capabilities: ['prompt.message', 'session.configure', 'session.persistence', 'permission'] });
+  }).connect({ versions: [1], capabilities: ['prompt.message', 'session.configure', 'session.persistence', 'permission', 'timeline.plugin'] });
   connection.onEvent(event => { ProviderEventSchema.parse(event); events.push(event); });
   await connection.send({ type: 'session.open', requestId: 'open-1', sessionId: 's1', config: { ...config, mode }, history: 'skip' });
   const prompt = (clientMessageId = 'm1', text = 'hello') => connection.send({ type: 'session.prompt', sessionId: 's1', prompt: { clientMessageId, delivery: 'auto', input: { type: 'message', content: [{ type: 'text', text }] } } });
@@ -55,6 +59,100 @@ test('a message produces one disposition, a response and one terminal turn', asy
   assert.equal(h.events.filter(e => e.type === 'session.turn' && e.state !== 'started').length, 1);
   assert.ok(h.events.some(e => e.type === 'timeline.item' && e.item.type === 'assistant_message' && e.item.text === 'hello'));
   await h.connection.close();
+});
+
+test('research icon state follows confirmed settings and preserves its native toggle identity', async (t) => {
+  const h = await setup([], 'chat');
+  t.after(() => h.connection.close());
+  const feature = () => {
+    const event = h.events.filter(e => e.type === 'session.config').at(-1)!;
+    assert.equal(event.type, 'session.config');
+    return event.config.settings.find(setting => setting.id === 'deep_research')!;
+  };
+  assert.equal(feature().type, 'toggle');
+  assert.equal(feature().label, 'Deep Research · 꺼짐');
+  await h.connection.send({ type: 'session.configure', requestId: 'on', sessionId: 's1', changes: { settings: { deep_research: true } } });
+  assert.equal(feature().value, true);
+  assert.equal(feature().label, 'Deep Research · 켜짐');
+  await h.connection.send({ type: 'session.configure', requestId: 'bad', sessionId: 's1', changes: { settings: { deep_research: 'true' } } });
+  assert.equal(feature().value, true);
+  assert.equal(feature().label, 'Deep Research · 켜짐');
+  await h.connection.send({ type: 'session.configure', requestId: 'off', sessionId: 's1', changes: { settings: { deep_research: false } } });
+  assert.equal(feature().value, false);
+  assert.equal(feature().label, 'Deep Research · 꺼짐');
+  assert.equal(h.sent.length, 0);
+});
+
+test('research publishes one persistent plan card, waits for approval, and updates progress through completion', async (t) => {
+  const finish = deferred();
+  let began = false;
+  const h = await setup(['Final report'], 'chat', { research: async options => {
+    if (!await options.onResearchPlan!('Research example.com using IANA official sources.')) throw new Error('denied');
+    began = true;
+    options.onStatus?.('웹사이트 3개 조사 중…');
+    await finish.promise;
+  } });
+  t.after(async () => { finish.resolve(); await h.connection.close(); });
+  await h.connection.send({ type: 'session.configure', requestId: 'research-on', sessionId: 's1', changes: { settings: { deep_research: true } } });
+  await h.prompt();
+  await until(() => h.events.some(e => e.type === 'session.permission'));
+  const permission = h.events.find(e => e.type === 'session.permission')!;
+  assert.equal(permission.type, 'session.permission');
+  const cards = () => h.events.flatMap(e => e.type === 'timeline.item' && e.item.type === 'plugin' ? [{ id: e.item.id, data: researchCardSchema.parse(e.item.data) }] : []);
+  assert.equal(began, false);
+  assert.equal(cards().at(-1)?.data.phase, 'plan');
+  assert.equal(cards().at(-1)?.data.permissionId, permission.request.id);
+  assert.match(cards().at(-1)!.data.plan!, /IANA/);
+  assert.equal(permission.request.actions?.[0].label, '연구 시작');
+  await h.connection.send({ type: 'session.permission', sessionId: 's1', permissionId: permission.request.id, response: { behavior: 'allow' } });
+  await until(() => began);
+  assert.equal(cards().at(-1)?.data.phase, 'researching');
+  assert.equal(cards().at(-1)?.data.status, '웹사이트 3개 조사 중…');
+  assert.equal(cards().at(-1)?.data.permissionId, undefined);
+  finish.resolve();
+  await until(() => h.events.some(e => e.type === 'session.turn' && e.state === 'completed'));
+  assert.equal(cards().at(-1)?.data.phase, 'completed');
+  assert.equal(new Set(cards().map(card => card.id)).size, 1);
+  assert.equal(h.events.filter(e => e.type === 'timeline.item' && e.item.type === 'assistant_message').length, 1);
+});
+
+test('declining a research plan cancels the card and never starts research or reports failure', async (t) => {
+  let began = false;
+  const h = await setup([], 'chat', { research: async options => {
+    if (!await options.onResearchPlan!('A plan awaiting approval')) throw new Error('plan not approved');
+    began = true;
+  } });
+  t.after(() => h.connection.close());
+  await h.connection.send({ type: 'session.configure', requestId: 'research-on', sessionId: 's1', changes: { settings: { deep_research: true } } });
+  await h.prompt();
+  await until(() => h.events.some(e => e.type === 'session.permission'));
+  const p = h.events.find(e => e.type === 'session.permission')!;
+  assert.equal(p.type, 'session.permission');
+  await h.connection.send({ type: 'session.permission', sessionId: 's1', permissionId: p.request.id, response: { behavior: 'deny' } });
+  await until(() => h.events.some(e => e.type === 'session.turn' && e.state !== 'started'));
+  assert.equal(began, false);
+  assert.ok(h.events.some(e => e.type === 'session.turn' && e.state === 'canceled'));
+  const cards = h.events.flatMap(e => e.type === 'timeline.item' && e.item.type === 'plugin' ? [researchCardSchema.parse(e.item.data)] : []);
+  assert.equal(cards.at(-1)?.phase, 'canceled');
+  assert.equal(cards.at(-1)?.permissionId, undefined);
+  assert.ok(!h.events.some(e => e.type === 'timeline.item' && e.item.type === 'error'));
+});
+
+test('research cards stay below the host byte limit even with JSON-escaped plan and progress text', async (t) => {
+  const h = await setup([], 'chat', { research: async options => {
+    if (await options.onResearchPlan!('\u0000'.repeat(16000))) options.onStatus?.('\u0000'.repeat(4000));
+  } });
+  t.after(() => h.connection.close());
+  await h.connection.send({ type: 'session.configure', requestId: 'research-on', sessionId: 's1', changes: { settings: { deep_research: true } } });
+  await h.prompt();
+  await until(() => h.events.some(e => e.type === 'session.permission'));
+  const permission = h.events.find(e => e.type === 'session.permission')!;
+  assert.equal(permission.type, 'session.permission');
+  await h.connection.send({ type: 'session.permission', sessionId: 's1', permissionId: permission.request.id, response: { behavior: 'allow' } });
+  await until(() => h.events.some(e => e.type === 'session.turn' && e.state === 'completed'));
+  for (const event of h.events) if (event.type === 'timeline.item' && event.item.type === 'plugin') {
+    assert.ok(Buffer.byteLength(JSON.stringify(event.item.data), 'utf8') < 65536);
+  }
 });
 
 test('revised web Markdown is emitted only once as the final assistant text', async (t) => {

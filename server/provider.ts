@@ -10,6 +10,8 @@ import { connectBrowserTools, type BrowserTools } from './browser-tools';
 import { GeminiBrowser } from './gemini-browser';
 import { LocalToolExecutor, describeTool, isMutation } from './local-tools';
 import { parseToolRequest, toolInstructions, type LocalToolRequest } from './tool-protocol';
+import { RESEARCH_FEATURE_ID, RESEARCH_ENABLED_LABEL, RESEARCH_DISABLED_LABEL } from '../shared/research-state';
+import type { ResearchCard } from '../shared/research';
 
 const models = [{ id: 'gemini-4-argon-web', label: 'Gemini 4 Argon · Web', description: 'Google Pro/Ultra 로그인 · Gemini 웹 사용량 적용' }];
 const thinkingOptions = [
@@ -20,7 +22,7 @@ const modes = [
   { id: 'read-only', label: '읽기 전용', description: '작업 폴더의 파일을 읽고 Gemini에 전달합니다. 수정과 명령 실행을 차단합니다.' },
   { id: 'ask', label: '작업마다 승인', description: '파일 읽기·수정·명령 실행 전에 승인합니다.' },
 ];
-const supported = ['prompt.message', 'session.configure', 'session.persistence', 'permission'] as const;
+const supported = ['prompt.message', 'session.configure', 'session.persistence', 'permission', 'timeline.plugin'] as const;
 type Browser = Pick<GeminiBrowser, 'open' | 'configure' | 'send' | 'readResearchReport' | 'stop' | 'close'>;
 type Executor = Pick<LocalToolExecutor, 'validate' | 'execute'>;
 interface Dependencies {
@@ -37,7 +39,7 @@ interface Session {
 }
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : '알 수 없는 연결 오류';
 function validUrl(url: unknown): url is string {
-  return typeof url === 'string' && /^https:\/\/gemini\.google\.com\/app(?:\/[a-zA-Z0-9_-]+)?$/.test(url);
+  return typeof url === 'string' && url.length <= 2048 && /^https:\/\/gemini\.google\.com\/app(?:\/[a-zA-Z0-9_-]+)?$/.test(url);
 }
 function validateConfig(config: ProviderSessionConfig) {
   if (!models.some(m => m.id === config.model) || !modes.some(m => m.id === config.mode) || !thinkingOptions.some(t => t.id === config.thinkingOption)) {
@@ -84,22 +86,23 @@ export function createProvider(overrides: Partial<Dependencies> = {}): ProviderR
       const configEvent = (s: Session) => emit({ type: 'session.config', sessionId: s.id, config: {
         model: s.config.model, mode: s.config.mode, thinkingOption: s.config.thinkingOption,
         models, modes, thinkingOptions,
-        settings: [{ type: 'toggle', id: 'deep_research', label: 'Deep Research', description: 'Gemini 웹의 조사 계획을 확인한 뒤 시작합니다. 웹 화면이 지원하는 조합만 사용할 수 있습니다.', value: s.config.settings.deep_research === true }],
+        settings: [{ type: 'toggle', id: RESEARCH_FEATURE_ID, label: s.config.settings.deep_research === true ? RESEARCH_ENABLED_LABEL : RESEARCH_DISABLED_LABEL, description: 'Gemini 웹의 조사 계획을 확인한 뒤 시작합니다. 웹 화면이 지원하는 조합만 사용할 수 있습니다.', value: s.config.settings.deep_research === true }],
       } });
       const persist = (s: Session) => {
         if (s.config.persist && s.url && validUrl(s.url)) emit({ type: 'session.persistence', sessionId: s.id,
           persistence: { version: 1, data: { url: s.url, history: s.history.map(h => ({ id: h.id, type: h.type, text: h.text })) } } });
       };
       const check = (s: Session) => { if (s.closed || s.closing || s.abort?.signal.aborted) throw new Error('작업이 취소되었습니다.'); };
-      async function permission(s: Session, name: string, title: string, detail: ProviderToolCallDetail, input: Record<string, any> = {}): Promise<boolean> {
+      async function permission(s: Session, name: string, title: string, detail: ProviderToolCallDetail, input: Record<string, any> = {}, onRequested?: (id: string) => void): Promise<boolean> {
         check(s);
         if (!capabilities.includes('permission')) throw new Error('Paseo가 이 세션의 승인 기능을 제공하지 않습니다.');
         const id = randomUUID();
         const response = await new Promise<ProviderPermissionResponse>(resolve => {
           s.permission = { id, resolve };
+          onRequested?.(id);
           emit({ type: 'session.permission', sessionId: s.id, request: { id, name, title,
             kind: detail.type === 'plan' ? 'plan' : 'tool', detail, input,
-            actions: [{ id: 'allow', label: '이번 작업 허용', behavior: 'allow', variant: 'primary' }, { id: 'deny', label: '거절', behavior: 'deny' }],
+            actions: [{ id: 'allow', label: name === 'deep_research' ? '연구 시작' : '이번 작업 허용', behavior: 'allow', variant: 'primary' }, { id: 'deny', label: name === 'deep_research' ? '취소' : '거절', behavior: 'deny' }],
           } });
         });
         check(s);
@@ -166,8 +169,22 @@ export function createProvider(overrides: Partial<Dependencies> = {}): ProviderR
       async function run(s: Session, text: string, turnId: string, controller: AbortController) {
         let terminal: 'completed' | 'failed' | 'canceled' = 'completed';
         let failure: string | undefined;
+        let research: ResearchCard | undefined;
+        let planDeclined = false;
+        const researchCard = (patch: Partial<ResearchCard>) => {
+          if (!research || s.abort !== controller) return;
+          research = { ...research, ...patch };
+          // Plugin rows replace by ID; unlike assistant text, status updates do not append.
+          if (capabilities.includes('timeline.plugin')) item(s, { type: 'plugin', id: `${turnId}:research`,
+            pluginId: 'paseo-gemini-web', kind: 'deep-research', version: 1,
+            data: JSON.parse(JSON.stringify(research)) });
+        };
         try {
           const recovery = /^\/research-result(?:[ \t]+(\S+))?\s*$/.exec(text);
+          if (s.config.settings.deep_research === true && !recovery) {
+            research = { phase: 'preparing', status: '조사 계획을 준비하고 있습니다…' };
+            researchCard({});
+          }
           if (recovery?.[1]) {
             if (!validUrl(recovery[1])) throw new Error('Gemini 대화 URL만 사용할 수 있습니다.');
             if (s.tab && s.url !== recovery[1]) throw new Error('다른 대화의 보고서는 새 에이전트에서 /research-result URL로 가져와 주세요.');
@@ -194,11 +211,27 @@ export function createProvider(overrides: Partial<Dependencies> = {}): ProviderR
               // Paseo 0.11 appends non-prefix snapshot revisions. Gemini's rendered
               // Markdown can rewrite earlier characters, so publish the final text once.
               onText: () => {},
-              onStatus: status => { if (s.abort === controller && !controller.signal.aborted) notice(s, status); },
-              onResearchPlan: plan => permission(s, 'deep_research', '이 계획으로 Deep Research를 시작할까요?', { type: 'plan', text: plan }),
+              onStatus: status => {
+                if (s.abort !== controller || controller.signal.aborted) return;
+                if (research) researchCard({ status: (status === 'Gemini Deep Research started.' ? '조사를 시작했습니다…'
+                  : status === 'Waiting for your approval of the Gemini research plan.' ? '조사 계획 확인을 기다리고 있습니다.' : status).slice(0, 2000) });
+                else notice(s, status);
+              },
+              onResearchPlan: async (plan: string, url?: string) => {
+                if (url && validUrl(url)) { s.url = url; persist(s); }
+                const accepted = await permission(s, 'deep_research', '이 계획으로 Deep Research를 시작할까요?', { type: 'plan', text: plan }, {}, permissionId => {
+                  researchCard({ phase: 'plan', status: '계획을 확인한 뒤 연구 시작을 눌러 주세요.',
+                    plan: plan.length > 8000 ? `${plan.slice(0, 8000)}\n\n전체 계획은 승인 창에서 확인하세요.` : plan,
+                    permissionId, ...(s.url ? { url: s.url } : {}) });
+                });
+                if (!accepted) { planDeclined = true; controller.abort(); return false; }
+                researchCard({ phase: 'researching', status: '연구 시작 중…', permissionId: undefined });
+                return true;
+              },
             });
             check(s);
             if (validUrl(response.url)) s.url = response.url;
+            researchCard({ phase: 'completed', status: '조사가 완료되었습니다. 아래에서 보고서를 확인하세요.', permissionId: undefined, ...(s.url ? { url: s.url } : {}) });
             const tool = toolsEnabled ? parseToolRequest(response.text) : null;
             if (!tool) item(s, { type: 'assistant_message', id: responseId, text: response.text });
             persist(s);
@@ -213,6 +246,8 @@ export function createProvider(overrides: Partial<Dependencies> = {}): ProviderR
           if (terminal === 'failed') { failure = errorMessage(error); item(s, { type: 'error', id: `${turnId}:error`, message: failure }); }
         } finally {
           resolvePermission(s, { behavior: 'deny', message: '작업 종료' });
+          if (terminal !== 'completed') researchCard({ phase: terminal, permissionId: undefined,
+            status: terminal === 'failed' ? failure!.slice(0, 2000) : planDeclined ? '조사 계획을 취소했습니다. 변경할 내용을 새 메시지로 보내 주세요.' : '작업이 중지되었습니다.' });
           persist(s);
           if (s.abort === controller) { s.abort = undefined; s.task = undefined; }
           emit({ type: 'session.turn', sessionId: s.id, turnId, state: terminal, ...(failure ? { error: { message: failure } } : {}) });

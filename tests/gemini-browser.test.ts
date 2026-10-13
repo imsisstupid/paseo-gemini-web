@@ -347,13 +347,48 @@ test('research starts only after plan approval and emits only the completed repo
   const result = await new GeminiBrowser(tools, { pollMs: 1, timeoutMs: 1000 }).send('tab', 'Research', options({ deepResearch: true,
     onText: text => chunks.push(text),
     onStatus: text => statuses.push(text),
-    onResearchPlan: async text => { assert.equal(text, 'Research plan'); assert.equal(tools.planApproved, false); approvals++; return true; } }));
+    onResearchPlan: async (text: string, url?: string) => {
+      assert.equal(text, 'Research plan');
+      assert.equal(url, 'https://gemini.google.com/app/dom-test');
+      assert.equal(tools.planApproved, false);
+      approvals++;
+      return true;
+    } }));
   assert.equal(approvals, 1);
   assert.equal(tools.planApproved, true);
   assert.equal(result.text, 'Finished report');
   assert.deepEqual(chunks, ['Finished report']);
   assert.ok(statuses.includes('Researching 22 sites...'));
 });
+
+for (const phase of ['running', 'completed'] as const) {
+  test(`research already ${phase} in Gemini while Paseo approval is pending continues without clicking Start again`, async () => {
+    const tools = new DomBrowser([{ responses: [{ text: 'Research plan', complete: true }], researchPlanReady: true }]);
+    let approve!: (accepted: boolean) => void;
+    let notifyRequested!: () => void;
+    const permission = new Promise<boolean>(resolve => { approve = resolve; });
+    const requested = new Promise<void>(resolve => { notifyRequested = resolve; });
+    const chunks: string[] = [];
+    const send = new GeminiBrowser(tools, { pollMs: 1, timeoutMs: 100 }).send('tab', 'Research', options({
+      deepResearch: true,
+      onText: text => chunks.push(text),
+      onResearchPlan: async () => { notifyRequested(); return permission; },
+    }));
+    await requested;
+    assert.equal(tools.planApproved, false);
+    assert.deepEqual(chunks, []);
+    const report = { responses: [{ text: 'Finished report', complete: true }], researchReport: { text: 'Finished report', complete: true }, controls: {} };
+    tools.inspections.splice(0, tools.inspections.length,
+      ...(phase === 'running' ? [{ researchRunning: true, controls: {} }] : []), report);
+    tools.poll = 0;
+    approve(true);
+    const result = await send;
+    assert.equal(result.text, 'Finished report');
+    assert.equal(tools.planApproved, false);
+    assert.deepEqual(chunks, ['Finished report']);
+    assert.equal(tools.calls.some(call => (call.args.command as any)?.target === 'start-research'), false);
+  });
+}
 
 test('declining a research plan never activates the start button', async () => {
   const tools = new DomBrowser([{ responses: [{ text: 'Research plan', complete: true }], researchPlanReady: true }]);

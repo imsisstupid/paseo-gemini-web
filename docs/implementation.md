@@ -34,6 +34,14 @@ The public repository contains the standalone plugin, documentation, and tests. 
 - Gemini renders the completed report in a separate `deep-research-immersive-panel`. The adapter requires the latest completed research card, a matching panel title, finished content, and no active generation before returning the report. It includes used sources only.
 - The actual IANA report was returned through a new Paseo provider agent using `/research-result` without creating another research query: 1,456 characters, seven source links, successful terminal event.
 - Live research validation covered plan approval/start in the earlier build and report recovery in the final build. The final automatic plan/start/report composition is covered by controlled browser tests; it was not rerun as a second task consuming the subscription's research quota.
-- Paseo 0.11 appends non-prefix text revisions. The provider buffers rendered Markdown and publishes one final assistant message; research progress uses status notifications.
-- The current automated suite has 91 passing tests, typecheck passes, and the production dependency audit reports no vulnerabilities.
+- Paseo 0.11 appends non-prefix text revisions. The provider buffers rendered Markdown and publishes one final assistant message; research progress updates a plugin card with one stable ID per turn.
+- The research card keeps the plan visible, matches its buttons to the live pending permission, refreshes that permission before responding, and suppresses duplicate clicks. Declining a plan cancels the turn instead of reporting a provider failure.
+- The existing Deep Research icon uses a narrow desktop/web style keyed to the feature ID and its committed ON label. No extra toggle or installed Paseo file modification is needed. This compatibility style relies on Paseo 0.11 DOM attributes; native mobile clients keep their normal feature control.
 - Temporary inspection plugins were removed; local diagnostic artifacts are excluded from the public repository.
+
+## Research UI update (0.1.1)
+
+- The suite has 108 passing tests and a passing typecheck, including native-icon CSS changes, live permission gating, duplicate clicks, cancellation, per-turn card updates, and bounded card payloads.
+- Live Paseo UI verification clicked the existing icon through OFF → ON → OFF and observed gray → blue → gray SVG strokes. A new research plan rendered with enabled action buttons. Clicking the card's start button approved the exact permission and started Gemini research; the same card then displayed the website count.
+- The additional research was stopped after progress verification. Its full report was not awaited; completed-card behavior is covered by tests, and the existing report recovery was verified separately above.
+- Research headings and primary actions use white text on a dark blue background, independent of the host accent color.

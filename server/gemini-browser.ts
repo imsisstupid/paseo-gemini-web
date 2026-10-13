@@ -6,7 +6,7 @@ export type SendOptions = {
   /** Current complete text of this response, including all text received so far. */
   onText: (text: string) => void;
   onStatus?: (text: string) => void;
-  onResearchPlan?: (plan: string) => Promise<boolean>;
+  onResearchPlan?: (plan: string, url?: string) => Promise<boolean>;
 };
 type Control = { role: string; label: string; ref?: string; attributes: string };
 type Response = { text: string; complete: boolean };
@@ -343,7 +343,7 @@ export class GeminiBrowser {
           if (!response?.text) throw new Error('Gemini shows a research approval button, but the research plan could not be read.');
           if (!options.onResearchPlan) throw new Error('Deep Research requires explicit approval of its research plan before starting.');
           onStatus?.('Waiting for your approval of the Gemini research plan.');
-          const accepted = await abortable(options.onResearchPlan(response.text), signal);
+          const accepted = await abortable(options.onResearchPlan(response.text, state.url), signal);
           checkAbort(signal);
           if (!accepted) throw new Error('Deep Research plan was not approved. Research was not started.');
           await this.click(browserId, c => c.role === 'button' && START_RESEARCH.test(c.label), 'Start research after approval', signal);
@@ -405,10 +405,19 @@ export class GeminiBrowser {
           if (!options.onResearchPlan) throw new Error('Deep Research requires explicit approval of its research plan.');
           planText = response.text;
           onStatus?.('Waiting for your approval of the Gemini research plan.');
-          const accepted = await abortable(options.onResearchPlan(planText), signal);
+          const accepted = await abortable(options.onResearchPlan(planText, state.url), signal);
           checkAbort(signal);
           if (!accepted) throw new Error('Deep Research plan was not approved. Research was not started.');
-          await this.clickDom(browserId, 'start-research', signal);
+          // The user may start research in Gemini while Paseo's approval is open.
+          // Read the latest research card again after approval before clicking.
+          const hasStarted = (current: DomState) => !current.researchPlanReady && Boolean(
+            current.researchRunning || this.completedResearchReport(current) || current.controls['open-report']);
+          state = await this.waitDom(browserId, current => hasStarted(current) || current.controls['start-research'] === true,
+            'Gemini start-research control', signal);
+          if (!hasStarted(state)) {
+            checkAbort(signal);
+            await this.call('gemini_dom', { browserId, command: { kind: 'click', target: 'start-research' } });
+          }
           approved = true; deadline = Date.now() + this.timeoutMs;
           onStatus?.('Gemini Deep Research started.');
           await delay(this.pollMs, signal); continue;
